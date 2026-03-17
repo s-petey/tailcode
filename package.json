@@ -51,11 +51,11 @@
     "publish:npm": "bun run check && bun run build && bun publish"
   },
   "dependencies": {
-    "@effect/atom-solid": "4.0.0-beta.12",
-    "@effect/platform-bun": "4.0.0-beta.12",
+    "@effect/atom-solid": "4.0.0-beta.33",
+    "@effect/platform-bun": "4.0.0-beta.33",
     "@opentui/core": "0.1.81",
     "@opentui/solid": "0.1.81",
-    "effect": "4.0.0-beta.12",
+    "effect": "4.0.0-beta.33",
     "qrcode": "1.5.4",
     "solid-js": "1.9.11"
   },
