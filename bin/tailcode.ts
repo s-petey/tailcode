@@ -213,30 +213,21 @@ async function publishWithTailscale(port: number): Promise<string> {
 }
 
 async function runStart(port: number, password?: string) {
+  // Check Tailscale is connected (don't try to login - that's for TUI only)
   try {
-    process.stderr.write("Checking Tailscale connection...\n")
-    await runTailscale(["ip", "-4"])
+    const result = await runTailscale(["ip", "-4"])
+    if (result.code !== 0) {
+      process.stderr.write("Tailscale is not connected.\n")
+      process.stderr.write(`\nRun 'tailcode' (without --start) for interactive setup.\n`)
+      process.exit(1)
+    }
   } catch (e) {
     if (e instanceof BinaryNotFound) {
       process.stderr.write(`${e.binary} is not installed\n`)
       process.stderr.write(`\nRun 'tailcode' (without --start) for interactive setup.\n`)
       process.exit(1)
     }
-
-    process.stderr.write("Tailscale is not connected. Starting login flow...\n")
-    try {
-      await runTailscale(["up", "--qr"])
-    } catch {
-      // Ignore errors from up command, it might show QR
-    }
-
-    try {
-      await waitForTailscaleConnection()
-    } catch {
-      process.stderr.write("Tailscale issue: Timed out waiting for Tailscale to connect\n")
-      process.stderr.write(`\nRun 'tailcode' (without --start) for interactive setup.\n`)
-      process.exit(1)
-    }
+    throw e
   }
 
   const alreadyHealthy = await checkOpenCodeHealth(port)
