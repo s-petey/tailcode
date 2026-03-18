@@ -1,5 +1,11 @@
 #!/usr/bin/env bun
 
+import { Effect, Layer } from "effect"
+import { AppConfig } from "../src/services/config.js"
+import { Tailscale } from "../src/services/tailscale.js"
+import { OpenCode } from "../src/services/opencode.js"
+import { Tailnet } from "../src/services/tailnet.js"
+import { BunServices } from "@effect/platform-bun"
 import { BinaryNotFound, CommandFailed, HealthCheckFailed } from "../src/services/errors.js"
 
 const DEFAULT_PORT = 4096
@@ -60,197 +66,18 @@ async function runAttach(port: number) {
   process.exit(await child.exited)
 }
 
-async function runTailscale(args: string[]): Promise<{ code: number; output: string }> {
-  const bin = Bun.which("tailscale")
-  if (!bin) {
-    throw new BinaryNotFound({ binary: "tailscale" })
-  }
+async function runStart(port: number) {
+  const runtime = Layer.mergeAll(AppConfig.layer, Tailscale.layer, OpenCode.layer, BunServices.layer).pipe(
+    Layer.build,
+  )
 
-  const child = Bun.spawn([bin, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
+  const program = Effect.gen(function* () {
+    const tailnet = yield* Tailnet
+    const url = yield* tailnet.start({ interactive: false, onLog: (line) => process.stderr.write(line) })
+    return url
   })
 
-  const output = await new TextDecoder().decode(await child.all)
-  return { code: child.exitCode, output }
-}
-
-async function waitForTailscaleConnection(timeout = 30000): Promise<void> {
-  const start = Date.now()
-  while (Date.now() - start < timeout) {
-    const result = await runTailscale(["ip", "-4"])
-    if (result.code === 0) return
-    await new Promise((r) => setTimeout(r, 1000))
-  }
-  throw new Error("Timed out waiting for Tailscale to connect")
-}
-
-async function checkOpenCodeHealth(port: number): Promise<boolean> {
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/global/health`)
-    return response.ok
-  } catch {
-    return false
-  }
-}
-
-async function startOpenCode(port: number, password?: string): Promise<void> {
-  const bin = Bun.which("opencode")
-  if (!bin) {
-    throw new BinaryNotFound({ binary: "opencode" })
-  }
-
-  const args = ["serve", "--hostname", "127.0.0.1", "--port", String(port)]
-  const env: Record<string, string> = {}
-  if (password) {
-    env.OPENCODE_SERVER_PASSWORD = password
-  }
-
-  const child = Bun.spawn([bin, ...args], {
-    env,
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-
-  const start = Date.now()
-  const timeout = 30000
-  while (Date.now() - start < timeout) {
-    if (await checkOpenCodeHealth(port)) {
-      return
-    }
-    await new Promise((r) => setTimeout(r, 250))
-  }
-
-  const output = await new TextDecoder().decode(await child.all)
-  child.kill()
-  throw new HealthCheckFailed({ message: `OpenCode server did not become healthy\n${output}` })
-}
-
-async function parseServeStatus(): Promise<Array<{ url: string; proxy: string | undefined }>> {
-  const result = await runTailscale(["serve", "status", "--json"])
-  if (result.code !== 0) return []
-
-  const start = result.output.indexOf("{")
-  if (start === -1) return []
-
-  try {
-    const status = JSON.parse(result.output.slice(start))
-    const mappings: Array<{ url: string; proxy: string | undefined }> = []
-
-    const addMappings = (web: Record<string, any>) => {
-      if (!web) return
-      for (const [host, endpoint] of Object.entries(web)) {
-        const handlers = (endpoint as any).Handlers
-        if (!handlers || Object.keys(handlers).length === 0) {
-          mappings.push({ url: `https://${host}`, proxy: undefined })
-          continue
-        }
-        for (const [path, handler] of Object.entries(handlers)) {
-          const normalizedPath = path === "/" ? "" : path
-          mappings.push({
-            url: `https://${host}${normalizedPath}`,
-            proxy: (handler as any).Proxy,
-          })
-        }
-      }
-    }
-
-    if (status.Web) addMappings(status.Web)
-    if (status.Foreground) {
-      for (const node of Object.values(status.Foreground as Record<string, any>)) {
-        addMappings((node as any).Web)
-      }
-    }
-    if (status.Background) {
-      for (const node of Object.values(status.Background as Record<string, any>)) {
-        addMappings((node as any).Web)
-      }
-    }
-
-    return mappings
-  } catch {
-    return []
-  }
-}
-
-async function publishWithTailscale(port: number): Promise<string> {
-  const target = `http://127.0.0.1:${port}`
-
-  const statusMappings = await parseServeStatus()
-  const existing = statusMappings.find((m) => m.proxy === target)
-  if (existing) {
-    process.stderr.write("Reusing existing tailscale serve listener.\n")
-    return existing.url
-  }
-
-  process.stderr.write("Publishing with tailscale serve...\n")
-
-  const child = Bun.spawn(["tailscale", "serve", "--bg", "--yes", "--https", String(port), target], {
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-
-  const start = Date.now()
-  const timeout = 30000
-  while (Date.now() - start < timeout) {
-    const mappings = await parseServeStatus()
-    const found = mappings.find((m) => m.proxy === target)
-    if (found) return found.url
-    await new Promise((r) => setTimeout(r, 500))
-  }
-
-  const output = await new TextDecoder().decode(await child.all)
-  if (output.includes("listener already exists")) {
-    const match = output.match(/listener already exists for port\s+(\d+)/i)
-    if (match) {
-      const conflictPort = Number(match[1])
-      process.stderr.write(`Port ${conflictPort} is already in use. Turning off existing HTTPS listener on that port and retrying once...\n`)
-      await runTailscale(["serve", "--https", String(conflictPort), "off"])
-    }
-  }
-
-  throw new Error("Timed out waiting for tailscale serve to register proxy")
-}
-
-async function runStart(port: number, password?: string) {
-  // Check Tailscale is connected (don't try to login - that's for TUI only)
-  try {
-    const result = await runTailscale(["ip", "-4"])
-    if (result.code !== 0) {
-      process.stderr.write("Tailscale is not connected.\n")
-      process.stderr.write(`\nRun 'tailcode' (without --start) for interactive setup.\n`)
-      process.exit(1)
-    }
-  } catch (e) {
-    if (e instanceof BinaryNotFound) {
-      process.stderr.write(`${e.binary} is not installed\n`)
-      process.stderr.write(`\nRun 'tailcode' (without --start) for interactive setup.\n`)
-      process.exit(1)
-    }
-    throw e
-  }
-
-  const alreadyHealthy = await checkOpenCodeHealth(port)
-  if (!alreadyHealthy) {
-    process.stderr.write(`Starting OpenCode server on 127.0.0.1:${port}...\n`)
-    try {
-      await startOpenCode(port, password)
-    } catch (e) {
-      if (e instanceof BinaryNotFound) {
-        process.stderr.write(`${e.binary} is not installed\n`)
-        process.exit(1)
-      }
-      if (e instanceof HealthCheckFailed) {
-        process.stderr.write(`OpenCode server failed to start: ${e.message}\n`)
-        process.exit(1)
-      }
-      throw e
-    }
-  } else {
-    process.stderr.write(`OpenCode server already running on 127.0.0.1:${port}\n`)
-  }
-
-  const url = await publishWithTailscale(port)
+  const url = await Effect.runPromise(Effect.provide(program, runtime))
   process.stdout.write(`${url}\n`)
 }
 
@@ -264,7 +91,6 @@ if (args.includes("--help") || args.includes("-h")) {
 }
 
 const port = resolvePort()
-const password = process.env.TAILCODE_PASSWORD
 
 if (forceAttach) {
   const healthy = await isHealthy(port)
@@ -277,9 +103,9 @@ if (forceAttach) {
 }
 
 if (startMode) {
-  await runStart(port, password)
+  await runStart(port)
   process.exit(0)
 }
 
-// Default: always launch the wizard
+// Default: launch the wizard (TUI)
 await import("../src/main.tsx")

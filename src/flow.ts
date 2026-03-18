@@ -46,9 +46,15 @@ export const flowFn = appRuntime.fn<void>()(() =>
     const tailscale = yield* Tailscale
     const opencode = yield* OpenCode
 
-    // Step 1: Tailscale — ensure connected
+    // Step 1: Tailscale — ensure connected (interactive login for TUI)
     registry.set(step, "tailscale")
-    const bin = yield* tailscale.ensure(append)
+    const bin = yield* Effect.gen(function* () {
+      try {
+        return yield* tailscale.checkConnection()
+      } catch {
+        return yield* tailscale.login(append)
+      }
+    })
 
     // Step 2: OpenCode — start server (handle lives in scope via ChildProcess.spawn)
     registry.set(step, "opencode")

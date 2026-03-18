@@ -108,8 +108,10 @@ function pickRemoteUrl(statusOutput: string, target: string) {
 export class Tailscale extends ServiceMap.Service<
   Tailscale,
   {
-    /** Ensure Tailscale is connected; prompts login when disconnected. */
-    readonly ensure: (
+    /** Check if Tailscale is connected; fails immediately if not (for CLI). */
+    readonly checkConnection: () => Effect.Effect<string, BinaryNotFound | CommandFailed | PlatformError.PlatformError>
+    /** Interactive login flow (for TUI). */
+    readonly login: (
       append: (line: string) => void,
     ) => Effect.Effect<string, BinaryNotFound | CommandFailed | PlatformError.PlatformError>
     /** Publish local OpenCode port via tailscale serve and return remote URL. */
@@ -149,22 +151,30 @@ export class Tailscale extends ServiceMap.Service<
 
       const retryPublishPolicy = Schedule.spaced(Duration.millis(500)).pipe(Schedule.both(Schedule.recurs(28)))
 
-      /** Ensure daemon availability and interactive login if needed. */
-      const ensure = Effect.fn("Tailscale.ensure")(function* (append: (line: string) => void) {
+      /** Check if Tailscale is connected; fails immediately if not (for CLI). */
+      const checkConnection = Effect.fn("Tailscale.checkConnection")(function* () {
         const bin = Bun.which("tailscale")
         if (!bin) return yield* new BinaryNotFound({ binary: "tailscale" })
 
-        append("Checking Tailscale connection...\n")
         const checkCode = yield* run(bin, ["ip", "-4"]).pipe(
           Effect.timeoutOrElse({
             duration: Duration.seconds(3),
             onTimeout: () => Effect.succeed(1),
           }),
         )
-        if (checkCode === 0) return bin
+        if (checkCode !== 0) {
+          return yield* new CommandFailed({ command: "tailscale ip", message: "not connected" })
+        }
+        return bin
+      })
+
+      /** Interactive login flow (for TUI). */
+      const login = Effect.fn("Tailscale.login")(function* (append: (line: string) => void) {
+        const bin = Bun.which("tailscale")
+        if (!bin) return yield* new BinaryNotFound({ binary: "tailscale" })
 
         append("Tailscale is not connected. Starting login flow...\n")
-        const login = yield* runString(bin, ["up", "--qr"]).pipe(
+        const loginResult = yield* runString(bin, ["up", "--qr"]).pipe(
           Effect.timeoutOrElse({
             duration: Duration.seconds(60),
             onTimeout: () => Effect.succeed(""),
@@ -172,13 +182,13 @@ export class Tailscale extends ServiceMap.Service<
           Effect.orElseSucceed(() => ""),
         )
 
-        const loginURL = parseURL(login)
+        const loginURL = parseURL(loginResult)
         if (loginURL) {
           append(`Open this URL (or scan QR): ${loginURL}\n`)
           append(renderQR(loginURL) + "\n")
-        } else if (login) {
+        } else if (loginResult) {
           append("Follow the Tailscale login prompts in your terminal.\n")
-          append(trim(login, 4000) + "\n")
+          append(trim(loginResult, 4000) + "\n")
         }
 
         yield* Effect.retryOrElse(waitForTailnetConnection(bin), retryConnectionPolicy, () =>
@@ -300,7 +310,8 @@ export class Tailscale extends ServiceMap.Service<
       })
 
       return {
-        ensure,
+        checkConnection,
+        login,
         publish,
       }
     }),
