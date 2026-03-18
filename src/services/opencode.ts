@@ -82,7 +82,12 @@ export class OpenCode extends ServiceMap.Service<
         }).pipe(
           Effect.timeoutOrElse({
             duration: Duration.seconds(2),
-            onTimeout: () => Effect.fail(new HealthCheckFailed({ message: "health check timeout" })),
+            onTimeout: () =>
+              Effect.fail(
+                new HealthCheckFailed({
+                  message: "health check timeout",
+                }),
+              ),
           }),
         )
 

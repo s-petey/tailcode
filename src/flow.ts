@@ -27,7 +27,7 @@ function resolveShutdownWaiters() {
 export function signalExit() {
   if (exitSignaled) return
   exitSignaled = true
-  Deferred.doneUnsafe(exitSignal, Effect.succeed(undefined))
+  Deferred.doneUnsafe(exitSignal, Effect.void)
 }
 
 export function waitForFlowStop() {

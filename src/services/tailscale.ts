@@ -136,12 +136,23 @@ export class Tailscale extends ServiceMap.Service<
         run(bin, ["ip", "-4"]).pipe(
           Effect.timeoutOrElse({
             duration: Duration.seconds(2),
-            onTimeout: () => Effect.fail(new CommandFailed({ command: "tailscale ip", message: "timeout" })),
+            onTimeout: () =>
+              Effect.fail(
+                new CommandFailed({
+                  command: "tailscale ip",
+                  message: "timeout",
+                }),
+              ),
           }),
           Effect.flatMap((code) =>
             code === 0
               ? Effect.void
-              : Effect.fail(new CommandFailed({ command: "tailscale ip", message: "not connected yet" })),
+              : Effect.fail(
+                  new CommandFailed({
+                    command: "tailscale ip",
+                    message: "not connected yet",
+                  }),
+                ),
           ),
         )
 
