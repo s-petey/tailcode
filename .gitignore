@@ -28,7 +28,6 @@ coverage/
 .vscode/
 
 # Misc
-bun.lock
 .reference/
 /.claude
 /.opencode/plans

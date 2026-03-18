@@ -51,17 +51,17 @@
     "publish:npm": "bun run check && bun run build && bun publish"
   },
   "dependencies": {
-    "@effect/atom-solid": "4.0.0-beta.12",
-    "@effect/platform-bun": "4.0.0-beta.12",
+    "@effect/atom-solid": "^4.0.0-beta.0",
+    "@effect/platform-bun": "^4.0.0-beta.35",
     "@opentui/core": "0.1.81",
     "@opentui/solid": "0.1.81",
-    "effect": "4.0.0-beta.12",
+    "effect": "^4.0.0-beta.35",
     "qrcode": "1.5.4",
     "solid-js": "1.9.11"
   },
   "devDependencies": {
-    "@effect/language-service": "0.76.0",
-    "@effect/vitest": "4.0.0-beta.12",
+    "@effect/language-service": "^0.80.0",
+    "@effect/vitest": "^4.0.0-beta.35",
     "@tsconfig/bun": "^1.0.10",
     "@types/bun": "^1.3.9",
     "@types/qrcode": "^1.5.6",
