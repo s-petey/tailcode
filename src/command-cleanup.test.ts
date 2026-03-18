@@ -2,14 +2,16 @@ import * as ChildProcess from "effect/unstable/process/ChildProcess"
 import { BunServices } from "@effect/platform-bun"
 import { expect, test } from "bun:test"
 import { Effect, Exit, Scope } from "effect"
+import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 
 // Start `sh -c "sleep 60"` which creates sh (parent) -> sleep (child).
 // Close the scope. Both should be killed via process group signal.
 test("ChildProcess.spawn scope cleanup kills child processes when scope closes", async () => {
   const program = Effect.gen(function* () {
     const scope = yield* Scope.make()
+    const spawner = yield* ChildProcessSpawner
 
-    const proc = yield* ChildProcess.spawn(ChildProcess.make("sh", ["-c", "sleep 60"])).pipe(Scope.provide(scope))
+    const proc = yield* spawner.spawn(ChildProcess.make("sh", ["-c", "sleep 60"])).pipe(Scope.provide(scope))
 
     const pid = Number(proc.pid)
 
@@ -32,9 +34,9 @@ test("ChildProcess.spawn scope cleanup kills child processes when scope closes",
     expect(alive).toBe(false)
 
     // No lingering `sleep 60` children either
-    const exitCode = yield* ChildProcess.exitCode(ChildProcess.make("pgrep", ["-f", "sleep 60"])).pipe(
-      Effect.orElseSucceed(() => 1),
-    )
+    const exitCode = yield* spawner
+      .exitCode(ChildProcess.make("pgrep", ["-f", "sleep 60"]))
+      .pipe(Effect.orElseSucceed(() => 1))
     // pgrep returns 1 when no processes match
     expect(Number(exitCode)).toBe(1)
   }).pipe(Effect.provide(BunServices.layer))

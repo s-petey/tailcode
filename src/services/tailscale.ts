@@ -297,7 +297,7 @@ export class Tailscale extends ServiceMap.Service<
           command: "tailscale serve",
           message: "Timed out waiting for tailscale serve to register proxy",
         })
-      })
+      }, Effect.scoped)
 
       return {
         ensure,

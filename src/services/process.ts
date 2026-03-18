@@ -15,7 +15,7 @@ export const command = (bin: string, args: string[], options?: CommandOptions) =
 
 /** Spawn a process in an existing scope so finalization is tied to that scope. */
 export const spawnInScope = (
-  spawner: ChildProcessSpawner,
+  spawner: ChildProcessSpawner["Service"],
   scope: Scope.Scope,
   bin: string,
   args: string[],
@@ -23,11 +23,20 @@ export const spawnInScope = (
 ) => Scope.provide(spawner.spawn(command(bin, args, options)), scope)
 
 /** Run a command to completion and return only its exit code. */
-export const spawnExitCode = (spawner: ChildProcessSpawner, bin: string, args: string[], options?: CommandOptions) =>
-  Effect.scoped(spawner.spawn(command(bin, args, options)).pipe(Effect.flatMap((handle) => handle.exitCode)))
+export const spawnExitCode = (
+  spawner: ChildProcessSpawner["Service"],
+  bin: string,
+  args: string[],
+  options?: CommandOptions,
+) => Effect.scoped(spawner.spawn(command(bin, args, options)).pipe(Effect.flatMap((handle) => handle.exitCode)))
 
 /** Run a command to completion and collect combined stdout/stderr text. */
-export const spawnString = (spawner: ChildProcessSpawner, bin: string, args: string[], options?: CommandOptions) =>
+export const spawnString = (
+  spawner: ChildProcessSpawner["Service"],
+  bin: string,
+  args: string[],
+  options?: CommandOptions,
+) =>
   Effect.scoped(
     spawner
       .spawn(command(bin, args, options))
