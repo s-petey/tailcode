@@ -1,8 +1,11 @@
 import { Duration, Effect, Layer, Option, PlatformError, Schedule, Schema, Scope, ServiceMap } from "effect"
+import type { ChildProcessHandle } from "effect/unstable/process/ChildProcessSpawner"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { BinaryNotFound, CommandFailed } from "./errors.js"
 import { parseURL, renderQR, trim } from "../qr.js"
 import { ignoreErrors, spawnExitCode, spawnString, spawnInScope, streamToAppender } from "./process.js"
+
+type Append = (line: string) => void
 
 // ---------------------------------------------------------------------------
 // Parsing helpers
@@ -125,15 +128,66 @@ export class Tailscale extends ServiceMap.Service<
       const spawner = yield* ChildProcessSpawner
       const scope = yield* Effect.scope
 
-      const run = (bin: string, args: string[]) => spawnExitCode(spawner, bin, args)
+      const tailscaleIpArgs = ["ip", "-4"] as const
+      const serveTimeoutMessage = "Timed out waiting for tailscale serve to register proxy"
+      const serveRegisteringMessage = "waiting for tailscale serve to register proxy..."
 
-      const runString = (bin: string, args: string[]) => spawnString(spawner, bin, args)
+      const serveFailed = (message: string) =>
+        new CommandFailed({
+          command: "tailscale serve",
+          message,
+        })
 
-      const readServeStatus = (bin: string) =>
+      const run: (bin: string, args: string[]) => Effect.Effect<number, PlatformError.PlatformError> = (bin, args) =>
+        spawnExitCode(spawner, bin, args)
+
+      const runString: (bin: string, args: string[]) => Effect.Effect<string, PlatformError.PlatformError> = (
+        bin,
+        args,
+      ) => spawnString(spawner, bin, args)
+
+      const readServeStatus: (bin: string) => Effect.Effect<string, never, never> = (bin) =>
         runString(bin, ["serve", "status", "--json"]).pipe(Effect.catch(() => Effect.succeed("")))
 
-      const waitForTailnetConnection = (bin: string) =>
-        run(bin, ["ip", "-4"]).pipe(
+      const resolveBinary: () => Effect.Effect<string, BinaryNotFound> = () => {
+        const bin = Bun.which("tailscale")
+        return bin ? Effect.succeed(bin) : Effect.fail(new BinaryNotFound({ binary: "tailscale" }))
+      }
+
+      const checkInitialConnection: (bin: string) => Effect.Effect<number, PlatformError.PlatformError> = (bin) =>
+        run(bin, [...tailscaleIpArgs]).pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(3),
+            onTimeout: () => Effect.succeed(1),
+          }),
+        )
+
+      const runLoginFlow: (bin: string) => Effect.Effect<string, PlatformError.PlatformError> = (bin) =>
+        runString(bin, ["up", "--qr"]).pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(60),
+            onTimeout: () => Effect.succeed(""),
+          }),
+          Effect.orElseSucceed(() => ""),
+        )
+
+      const appendLoginInstructions: (login: string, append: Append) => void = (login, append) => {
+        const loginURL = parseURL(login)
+        if (loginURL) {
+          append(`Open this URL (or scan QR): ${loginURL}\n`)
+          append(renderQR(loginURL) + "\n")
+          return
+        }
+
+        if (!login) return
+        append("Follow the Tailscale login prompts in your terminal.\n")
+        append(trim(login, 4000) + "\n")
+      }
+
+      const waitForTailnetConnection: (
+        bin: string,
+      ) => Effect.Effect<void, CommandFailed | PlatformError.PlatformError> = (bin) =>
+        run(bin, [...tailscaleIpArgs]).pipe(
           Effect.timeoutOrElse({
             duration: Duration.seconds(2),
             onTimeout: () =>
@@ -160,39 +214,10 @@ export class Tailscale extends ServiceMap.Service<
 
       const retryPublishPolicy = Schedule.spaced(Duration.millis(500)).pipe(Schedule.both(Schedule.recurs(28)))
 
-      /** Ensure daemon availability and interactive login if needed. */
-      const ensure = Effect.fn("Tailscale.ensure")(function* (append: (line: string) => void) {
-        const bin = Bun.which("tailscale")
-        if (!bin) return yield* new BinaryNotFound({ binary: "tailscale" })
-
-        append("Checking Tailscale connection...\n")
-        const checkCode = yield* run(bin, ["ip", "-4"]).pipe(
-          Effect.timeoutOrElse({
-            duration: Duration.seconds(3),
-            onTimeout: () => Effect.succeed(1),
-          }),
-        )
-        if (checkCode === 0) return bin
-
-        append("Tailscale is not connected. Starting login flow...\n")
-        const login = yield* runString(bin, ["up", "--qr"]).pipe(
-          Effect.timeoutOrElse({
-            duration: Duration.seconds(60),
-            onTimeout: () => Effect.succeed(""),
-          }),
-          Effect.orElseSucceed(() => ""),
-        )
-
-        const loginURL = parseURL(login)
-        if (loginURL) {
-          append(`Open this URL (or scan QR): ${loginURL}\n`)
-          append(renderQR(loginURL) + "\n")
-        } else if (login) {
-          append("Follow the Tailscale login prompts in your terminal.\n")
-          append(trim(login, 4000) + "\n")
-        }
-
-        yield* Effect.retryOrElse(waitForTailnetConnection(bin), retryConnectionPolicy, () =>
+      const awaitTailnetConnection: (
+        bin: string,
+      ) => Effect.Effect<void, CommandFailed | PlatformError.PlatformError> = (bin) =>
+        Effect.retryOrElse(waitForTailnetConnection(bin), retryConnectionPolicy, () =>
           Effect.fail(
             new CommandFailed({
               command: "tailscale ip",
@@ -201,100 +226,127 @@ export class Tailscale extends ServiceMap.Service<
           ),
         )
 
-        return bin
-      })
-
-      /** Publish localhost port into tailnet and register scope cleanup. */
-      const publish = Effect.fn("Tailscale.publish")(function* (
+      const spawnServe: (
         bin: string,
         port: number,
-        append: (line: string) => void,
-      ) {
-        const target = `http://127.0.0.1:${port}`
+        target: string,
+      ) => Effect.Effect<ChildProcessHandle, PlatformError.PlatformError> = (bin, port, target) =>
+        spawnInScope(spawner, scope, bin, ["serve", "--bg", "--yes", "--https", String(port), target])
 
-        const spawnServe = () =>
-          spawnInScope(spawner, scope, bin, ["serve", "--bg", "--yes", "--https", String(port), target])
+      const waitForProxy: (
+        bin: string,
+        target: string,
+      ) => Effect.Effect<string, CommandFailed | PlatformError.PlatformError> = (bin, target) => {
+        const pollForProxy = readServeStatus(bin).pipe(
+          Effect.flatMap((status) => {
+            const found = pickRemoteUrl(status, target)
+            if (found) return Effect.succeed(found)
+            return Effect.fail(serveFailed(serveRegisteringMessage))
+          }),
+        )
 
-        const waitForProxy = () => {
-          const pollForProxy = readServeStatus(bin).pipe(
-            Effect.flatMap((status) => {
-              const found = pickRemoteUrl(status, target)
-              if (found) return Effect.succeed(found)
-              return Effect.fail(
-                new CommandFailed({
-                  command: "tailscale serve",
-                  message: "waiting for tailscale serve to register proxy...",
-                }),
-              )
-            }),
-          )
+        return Effect.retryOrElse(pollForProxy, retryPublishPolicy, () => Effect.fail(serveFailed(serveTimeoutMessage)))
+      }
 
-          return Effect.retryOrElse(pollForProxy, retryPublishPolicy, () =>
-            Effect.fail(
-              new CommandFailed({
-                command: "tailscale serve",
-                message: "Timed out waiting for tailscale serve to register proxy",
-              }),
-            ),
-          )
-        }
+      const waitForProxyOptional: (bin: string, target: string) => Effect.Effect<Option.Option<string>> = (
+        bin,
+        target,
+      ) => waitForProxy(bin, target).pipe(Effect.option)
 
-        const existingStatus = yield* readServeStatus(bin)
-        if (parseServeMappings(existingStatus).some((item) => item.proxy === target)) {
+      const failServeTimedOut: () => Effect.Effect<never, CommandFailed> = () =>
+        Effect.fail(serveFailed(serveTimeoutMessage))
+
+      const reuseExistingListener: (
+        bin: string,
+        target: string,
+        append: Append,
+      ) => Effect.Effect<string | undefined> = (bin, target, append) =>
+        Effect.gen(function* () {
+          const existingStatus = yield* readServeStatus(bin)
+          if (!parseServeMappings(existingStatus).some((item) => item.proxy === target)) return undefined
+
           const existingUrl = pickRemoteUrl(existingStatus, target)
-          if (existingUrl) {
-            append("Reusing existing tailscale serve listener.\n")
-            return existingUrl
-          }
-        }
+          if (!existingUrl) return undefined
 
-        append("Publishing with tailscale serve...\n")
+          append("Reusing existing tailscale serve listener.\n")
+          return existingUrl
+        })
 
-        const handle = yield* spawnServe()
-
-        // Register cleanup as an acquired resource so release is tied atomically
-        // to the current scope even across interruption boundaries.
-        yield* Effect.acquireRelease(Effect.void, () =>
+      const registerServeCleanup: (bin: string, port: number) => Effect.Effect<void> = (bin, port) =>
+        Effect.acquireRelease(Effect.void, () =>
           ignoreErrors(run(bin, ["serve", "--https", String(port), "off"])),
         ).pipe(Scope.provide(scope))
 
+      const attachServeOutput: (
+        handle: ChildProcessHandle,
+        append: Append,
+      ) => Effect.Effect<{ getOutput: () => string }, never, Scope.Scope> = (handle, append) => {
         let serveOutput = ""
-        yield* Effect.forkScoped(
+        return Effect.forkScoped(
           streamToAppender(handle.all, (text) => {
             append(text)
             serveOutput = trim(serveOutput + text, 8000)
           }),
-        )
+        ).pipe(Effect.as({ getOutput: () => serveOutput }))
+      }
 
-        const firstAttempt = yield* waitForProxy().pipe(Effect.option)
+      const disableHttpsListener: (bin: string, port: number) => Effect.Effect<void> = (bin, port) =>
+        run(bin, ["serve", "--https", String(port), "off"]).pipe(Effect.ignore)
+
+      /** Ensure daemon availability and interactive login if needed. */
+      const ensure = Effect.fn("Tailscale.ensure")(function* (append: Append) {
+        const bin = yield* resolveBinary()
+
+        append("Checking Tailscale connection...\n")
+        const checkCode = yield* checkInitialConnection(bin)
+        if (checkCode === 0) return bin
+
+        append("Tailscale is not connected. Starting login flow...\n")
+        const login = yield* runLoginFlow(bin)
+        yield* Effect.sync(() => appendLoginInstructions(login, append))
+
+        yield* awaitTailnetConnection(bin)
+
+        return bin
+      })
+
+      /** Publish localhost port into tailnet and register scope cleanup. */
+      const publish = Effect.fn("Tailscale.publish")(function* (bin: string, port: number, append: Append) {
+        const target = `http://127.0.0.1:${port}`
+
+        const reused = yield* reuseExistingListener(bin, target, append)
+        if (reused) return reused
+
+        append("Publishing with tailscale serve...\n")
+
+        const handle = yield* spawnServe(bin, port, target)
+
+        // Register cleanup as an acquired resource so release is tied atomically
+        // to the current scope even across interruption boundaries.
+        yield* registerServeCleanup(bin, port)
+
+        const { getOutput } = yield* attachServeOutput(handle, append)
+
+        const firstAttempt = yield* waitForProxyOptional(bin, target)
         if (Option.isSome(firstAttempt)) return firstAttempt.value
 
-        const conflictPort = parseConflictPort(serveOutput)
+        const conflictPort = parseConflictPort(getOutput())
         if (conflictPort === undefined) {
-          return yield* new CommandFailed({
-            command: "tailscale serve",
-            message: "Timed out waiting for tailscale serve to register proxy",
-          })
+          return yield* failServeTimedOut()
         }
 
         append(
           `Port ${conflictPort} is already in use. Turning off existing HTTPS listener on that port and retrying once...\n`,
         )
-        yield* run(bin, ["serve", "--https", String(port), "off"]).pipe(Effect.ignore)
+        yield* disableHttpsListener(bin, port)
 
-        serveOutput = ""
-        const retryHandle = yield* spawnServe()
-        yield* Effect.forkScoped(
-          streamToAppender(retryHandle.all, (text) => {
-            append(text)
-            serveOutput = trim(serveOutput + text, 8000)
-          }),
-        )
+        const retryHandle = yield* spawnServe(bin, port, target)
+        const { getOutput: getRetryOutput } = yield* attachServeOutput(retryHandle, append)
 
-        const secondAttempt = yield* waitForProxy().pipe(Effect.option)
+        const secondAttempt = yield* waitForProxyOptional(bin, target)
         if (Option.isSome(secondAttempt)) return secondAttempt.value
 
-        const retryConflictPort = parseConflictPort(serveOutput)
+        const retryConflictPort = parseConflictPort(getRetryOutput())
         if (retryConflictPort !== undefined) {
           return yield* new CommandFailed({
             command: "tailscale serve",
@@ -304,10 +356,7 @@ export class Tailscale extends ServiceMap.Service<
           })
         }
 
-        return yield* new CommandFailed({
-          command: "tailscale serve",
-          message: "Timed out waiting for tailscale serve to register proxy",
-        })
+        return yield* failServeTimedOut()
       }, Effect.scoped)
 
       return {
