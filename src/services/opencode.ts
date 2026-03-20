@@ -5,6 +5,10 @@ import { BinaryNotFound, HealthCheckFailed } from "./errors.js"
 import { trim } from "../qr.js"
 import { spawnInScope, streamToAppender } from "./process.js"
 
+type Append = (line: string) => void
+type Password = string | Redacted.Redacted<string>
+type Env = Record<string, string>
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -15,8 +19,8 @@ export class OpenCode extends ServiceMap.Service<
     /** Start local OpenCode server and wait until health endpoint responds. */
     readonly start: (
       port: number,
-      password: string | Redacted.Redacted<string>,
-      append: (line: string) => void,
+      password: Password,
+      append: Append,
     ) => Effect.Effect<ChildProcessHandle | undefined, BinaryNotFound | HealthCheckFailed | PlatformError.PlatformError>
   }
 >()("@tailcode/OpenCode") {
@@ -25,57 +29,64 @@ export class OpenCode extends ServiceMap.Service<
       const spawner = yield* ChildProcessSpawner
       const scope = yield* Effect.scope
 
-      /** Start opencode bound to localhost and tie lifecycle to service scope. */
-      const start = Effect.fn("OpenCode.start")(function* (
-        port: number,
-        password: string | Redacted.Redacted<string>,
-        append: (line: string) => void,
-      ) {
-        const alreadyHealthy = yield* Effect.tryPromise({
-          try: () => fetch(`http://127.0.0.1:${port}/global/health`).then((r) => r.ok),
+      const healthUrl = (port: number) => `http://127.0.0.1:${port}/global/health`
+
+      const checkAlreadyHealthy: (port: number) => Effect.Effect<boolean> = (port) =>
+        Effect.tryPromise({
+          try: () => fetch(healthUrl(port)).then((r) => r.ok),
           catch: () => false as const,
         }).pipe(Effect.catch(() => Effect.succeed(false)))
 
-        if (alreadyHealthy) {
-          append(`OpenCode server already running on 127.0.0.1:${port}\n`)
-          return undefined
-        }
-
+      const resolveBinary: () => Effect.Effect<string, BinaryNotFound> = () => {
         const bin = Bun.which("opencode")
-        if (!bin) return yield* new BinaryNotFound({ binary: "opencode" })
+        return bin ? Effect.succeed(bin) : Effect.fail(new BinaryNotFound({ binary: "opencode" }))
+      }
 
-        append(`Starting OpenCode server on 127.0.0.1:${port}...\n`)
-
+      const buildEnv: (password: Password) => Env = (password) => {
         const env: Record<string, string> = {}
         for (const [k, v] of Object.entries(process.env)) {
           if (v !== undefined) env[k] = v
         }
+
         const passwordValue = Redacted.isRedacted(password) ? Redacted.value(password) : password
         if (passwordValue) env.OPENCODE_SERVER_PASSWORD = passwordValue
 
-        const handle = yield* spawnInScope(
-          spawner,
-          scope,
-          bin,
-          ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
-          {
-            env,
-            extendEnv: false,
-          },
-        )
+        return env
+      }
 
+      const spawnServer: (
+        bin: string,
+        port: number,
+        env: Env,
+      ) => Effect.Effect<ChildProcessHandle, PlatformError.PlatformError> = (bin, port, env) =>
+        spawnInScope(spawner, scope, bin, ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
+          env,
+          extendEnv: false,
+        })
+
+      const attachOutput: (
+        handle: ChildProcessHandle,
+        append: Append,
+      ) => Effect.Effect<{
+        readonly getBuffer: () => string
+      }> = (handle, append) => {
         let buffer = ""
-        yield* Effect.forkIn(
-          streamToAppender(handle.all, (text) => {
-            buffer = trim(buffer + text, 8000)
-            append(text)
-          }),
-          scope,
-        )
+        const fiber = streamToAppender(handle.all, (text) => {
+          buffer = trim(buffer + text, 8000)
+          append(text)
+        })
 
-        const checkHealth = Effect.tryPromise({
+        return Effect.forkIn(fiber, scope).pipe(
+          Effect.as({
+            getBuffer: () => buffer,
+          }),
+        )
+      }
+
+      const waitForHealth: (port: number) => Effect.Effect<void, HealthCheckFailed> = (port) =>
+        Effect.tryPromise({
           try: () =>
-            fetch(`http://127.0.0.1:${port}/global/health`).then((r) => {
+            fetch(healthUrl(port)).then((r) => {
               if (!r.ok) throw new Error("not healthy")
             }),
           catch: () => new HealthCheckFailed({ message: "not healthy yet" }),
@@ -91,16 +102,37 @@ export class OpenCode extends ServiceMap.Service<
           }),
         )
 
-        const healthCheckPolicy = Schedule.spaced(Duration.millis(250)).pipe(Schedule.both(Schedule.recurs(40)))
+      const failWithBuffer: (
+        handle: ChildProcessHandle,
+        getBuffer: () => string,
+      ) => Effect.Effect<never, HealthCheckFailed> = (handle, getBuffer) =>
+        Effect.gen(function* () {
+          yield* handle.kill().pipe(Effect.ignore)
+          return yield* new HealthCheckFailed({
+            message: `OpenCode server did not become healthy\n${getBuffer()}`,
+          })
+        })
 
-        yield* Effect.retryOrElse(checkHealth, healthCheckPolicy, () =>
-          Effect.gen(function* () {
-            yield* handle.kill().pipe(Effect.ignore)
-            return yield* new HealthCheckFailed({
-              message: `OpenCode server did not become healthy\n${buffer}`,
-            })
-          }),
-        )
+      const healthCheckPolicy = Schedule.spaced(Duration.millis(250)).pipe(Schedule.both(Schedule.recurs(40)))
+
+      /** Start opencode bound to localhost and tie lifecycle to service scope. */
+      const start = Effect.fn("OpenCode.start")(function* (port, password, append) {
+        const alreadyHealthy = yield* checkAlreadyHealthy(port)
+
+        if (alreadyHealthy) {
+          append(`OpenCode server already running on 127.0.0.1:${port}\n`)
+          return undefined
+        }
+
+        const bin = yield* resolveBinary()
+
+        append(`Starting OpenCode server on 127.0.0.1:${port}...\n`)
+
+        const env = buildEnv(password)
+        const handle = yield* spawnServer(bin, port, env)
+        const { getBuffer } = yield* attachOutput(handle, append)
+
+        yield* Effect.retryOrElse(waitForHealth(port), healthCheckPolicy, () => failWithBuffer(handle, getBuffer))
 
         return handle
       })
