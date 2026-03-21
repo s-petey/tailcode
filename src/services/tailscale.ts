@@ -111,6 +111,13 @@ function pickRemoteUrl(statusOutput: string, target: string) {
 export class Tailscale extends ServiceMap.Service<
   Tailscale,
   {
+    /** Check whether tailscale is currently connected to a tailnet. */
+    readonly isConnected: () => Effect.Effect<boolean, PlatformError.PlatformError>
+    /** Read currently published URL for localhost target, if present. */
+    readonly getPublishedUrl: (
+      bin: string,
+      port: number,
+    ) => Effect.Effect<string | undefined, PlatformError.PlatformError>
     /** Ensure Tailscale is connected; prompts login when disconnected. */
     readonly ensure: (
       append: (line: string) => void,
@@ -161,6 +168,13 @@ export class Tailscale extends ServiceMap.Service<
             onTimeout: () => Effect.succeed(1),
           }),
         )
+
+      const isConnected = Effect.fn("Tailscale.isConnected")(function* () {
+        const bin = yield* resolveBinary().pipe(Effect.catchTag("BinaryNotFound", () => Effect.succeed(undefined)))
+        if (!bin) return false
+        const code = yield* checkInitialConnection(bin)
+        return code === 0
+      })
 
       const runLoginFlow: (bin: string) => Effect.Effect<string, PlatformError.PlatformError> = (bin) =>
         runString(bin, ["up", "--qr"]).pipe(
@@ -272,6 +286,13 @@ export class Tailscale extends ServiceMap.Service<
           return existingUrl
         })
 
+      const getPublishedUrl = Effect.fn("Tailscale.getPublishedUrl")(function* (bin: string, port: number) {
+        const target = `http://127.0.0.1:${port}`
+        const status = yield* readServeStatus(bin)
+        if (!parseServeMappings(status).some((item) => item.proxy === target)) return undefined
+        return pickRemoteUrl(status, target)
+      })
+
       const registerServeCleanup: (bin: string, port: number) => Effect.Effect<void> = (bin, port) =>
         Effect.acquireRelease(Effect.void, () =>
           ignoreErrors(run(bin, ["serve", "--https", String(port), "off"])),
@@ -360,6 +381,8 @@ export class Tailscale extends ServiceMap.Service<
       }, Effect.scoped)
 
       return {
+        isConnected,
+        getPublishedUrl,
         ensure,
         publish,
       }

@@ -16,6 +16,8 @@ type Env = Record<string, string>
 export class OpenCode extends ServiceMap.Service<
   OpenCode,
   {
+    /** Check whether local OpenCode health endpoint is currently ready. */
+    readonly isReady: (port: number) => Effect.Effect<boolean>
     /** Start local OpenCode server and wait until health endpoint responds. */
     readonly start: (
       port: number,
@@ -138,6 +140,7 @@ export class OpenCode extends ServiceMap.Service<
       })
 
       return {
+        isReady: checkAlreadyHealthy,
         start,
       }
     }),

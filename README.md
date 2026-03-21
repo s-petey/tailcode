@@ -138,6 +138,7 @@ TAILCODE_PORT=4096 TAILCODE_PASSWORD=secret bun run start
 - The published URL is only reachable from devices on your Tailscale tailnet
 - OpenCode is bound to localhost to avoid exposing it on your LAN
 - `tailcode` always opens the setup wizard (use `tailcode --attach` for explicit attach)
+- `tailcode start` runs a non-interactive headless flow, publishes OpenCode to your tailnet, prints the URL, and stays running until you stop it
 - TailCode shows a local attach command after setup: `opencode attach http://127.0.0.1:4096`
 
 ## Binary Releases
