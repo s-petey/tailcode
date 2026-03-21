@@ -119,7 +119,7 @@ test("fails with BinaryNotFound when opencode binary is missing", async () => {
   spyOn(Bun, "which").mockImplementation(() => null)
   setFetchSequence(["bad"])
 
-expect(runStart("pw")).rejects.toMatchObject({
+  expect(runStart("pw")).rejects.toMatchObject({
     _tag: "BinaryNotFound",
     binary: "opencode",
   })

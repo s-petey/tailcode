@@ -30,6 +30,9 @@
     "access": "public"
   },
   "scripts": {
+    "test": "bun test ./src/**/*.unit.test.ts",
+    "test:integration": "bun test ./src/**/*.integration.test.ts",
+    "test:all": "bun run test && bun run test:integration",
     "dev": "bun run --conditions=browser --preserve-symlinks --hot src/main.tsx",
     "start": "bun run --conditions=browser --preserve-symlinks src/main.tsx",
     "showcase": "bun run --conditions=browser --preserve-symlinks src/showcase.tsx",
